@@ -1,0 +1,131 @@
+import requests
+import json
+import time
+
+# --- CONFIGURATION ---
+SOURCE_API_KEY = "<SourceKey>"
+
+# Source URLs
+LIST_URL = "https://prepby.me/api/v1/orders/?option=all&category=product&status=received"
+DETAIL_BASE_URL = "https://prepby.me/api/v1/orders/?option=find&category=product&order_no="
+
+# Destination URLs (Your Oracle APEX Endpoints)
+BASE_APEX = "https://example.oraclecloudapps.com/ords/elevate_ordg/inventory" #example change URL for your case
+URL_SHIPMENTS = f"{BASE_APEX}/sync_inbound_shipments"
+URL_STOCK     = f"{BASE_APEX}/sync_inbound_stock"
+
+# Headers
+headers = { "x-api-key": SOURCE_API_KEY, "Content-Type": "application/json" }
+oracle_headers = { "Content-Type": "application/json" }
+
+# --- STAGE 1: SYNC SHIPMENT LIST ---
+def sync_inbound_list():
+    print("\n--- Stage 1: Syncing Shipment Headers ---")
+    processed_orders = [] # We will store orders here to pass to Stage 2
+
+    try:
+        response = requests.get(LIST_URL, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            raw_list = data.get('data', [])
+            
+            for group in raw_list:
+                orders = group.get('orders', [])
+                for order in orders:
+                    # 1. Prepare Data for APEX
+                    payload = {
+                        "order_no": order.get('order_no'),
+                        "order_name": order.get('order_name'),
+                        "status": "received",
+                        "date_created": order.get('date_created'),
+                        "date_received": order.get('date_received'),
+                        "client_comment": order.get('client_comment')
+                    }
+                    
+                    # 2. Push to APEX
+                    try:
+                        res = requests.post(URL_SHIPMENTS, json=payload, headers=oracle_headers)
+                        if res.status_code == 200:
+                            print(f" ✅ Header Synced: {order.get('order_no')}")
+                            # Add to list for details syncing
+                            processed_orders.append((order.get('order_no'), order.get('order_name')))
+                        else:
+                            print(f" ⚠️ Error Header ({order.get('order_no')}): {res.text}")
+                    except Exception as e:
+                        print(f" ❌ Connection Error: {e}")
+            return processed_orders
+        else:
+            print(f"Source List Error: {response.status_code}")
+            return []
+    except Exception as e:
+        print(f"List Sync Error: {e}")
+        return []
+
+# --- STAGE 2: SYNC SHIPMENT DETAILS ---
+def sync_inbound_details(order_list):
+    print("\n--- Stage 2: Syncing Stock Items ---")
+    
+    for order_no, order_name in order_list:
+        url = f"{DETAIL_BASE_URL}{order_no}"
+        print(f"Fetching details for {order_no}...", end="")
+        
+        try:
+            response = requests.get(url, headers=headers)
+            
+            # Rate Limit Handling
+            if response.status_code == 429:
+                print(" Rate Limit! Waiting 60s...")
+                time.sleep(60)
+                continue
+            
+            if response.status_code == 200:
+                json_data = response.json()
+                items = json_data.get('data', {}).get('items', [])
+                
+                print(f" Found {len(items)} items.")
+                
+                for item in items:
+                    # SKU Logic
+                    sku = item.get('SKU')
+                    asin = item.get('ASIN')
+                    if not sku or sku == '-' or sku == '':
+                        sku = asin 
+                    
+                    if not sku: 
+                        print("   [Skip] Item has no SKU or ASIN")
+                        continue
+
+                    # 1. Prepare Payload for APEX Stock Table
+                    payload = {
+                        "inbound_order_no": order_no,
+                        "inbound_name": order_name,
+                        "sku": sku,
+                        "product_name": item.get('product_name'),
+                        "qty_received": item.get('quantity_received', 0),
+                        "qty_available": item.get('available', 0)
+                    }
+
+                    # 2. Push to APEX
+                    try:
+                        res = requests.post(URL_STOCK, json=payload, headers=oracle_headers)
+                        # Note: The PL/SQL we wrote auto-creates the product if missing
+                        if res.status_code != 200:
+                            print(f"   ⚠️ Item Error {sku}: {res.text}")
+                    except Exception as e:
+                        print(f"   ❌ Item Conn Error: {e}")
+                
+            time.sleep(1) # Polite delay
+        except Exception as e:
+            print(f" Detail Error: {e}")
+
+# --- MAIN EXECUTION ---
+if __name__ == "__main__":
+    # 1. Run Stage 1 (Headers)
+    orders_to_sync = sync_inbound_list()
+    
+    # 2. Run Stage 2 (Details) using the list from Stage 1
+    if orders_to_sync:
+        sync_inbound_details(orders_to_sync)
+        print("\nFull Sync Complete.")
+    else:
+        print("\nNo orders found to sync.")
