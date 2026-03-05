@@ -1,0 +1,98 @@
+import requests
+import json
+import time
+
+# --- CONFIGURATION ---
+# 1. Source API (Where we get data FROM)
+SOURCE_API_KEY = "YourSourceKey"
+SOURCE_URL = "https://prepby.me/api/v1/inventory/?category=product&page="
+
+# 2. Destination API (Where we send data TO - Your Oracle APEX)
+# Replace 'your-workspace' with your actual workspace name found in the URI
+DESTINATION_API_URL = "https://example.oraclecloudapps.com/ords/elevate_ordg/inventory/sync_product"
+
+def sync_master_products():
+    page = 1
+    has_more_data = True
+
+    # Headers for fetching FROM Source
+    source_headers = {
+        "x-api-key": SOURCE_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    # Headers for sending TO Oracle
+    oracle_headers = {
+        "Content-Type": "application/json"
+    }
+
+    print("--- 1. Syncing Master Product Data to Oracle APEX ---")
+
+    while has_more_data:
+        current_url = f"{SOURCE_URL}{page}"
+        print(f"Fetching Page {page}...")
+
+        try:
+            # 1. Fetch Data from Source
+            response = requests.get(current_url, headers=source_headers)
+            if response.status_code != 200:
+                print(f"Source API Error: {response.status_code}")
+                break
+
+            data = response.json()
+            
+            # Stop if no data
+            if not data.get('success') or not data.get('data', {}).get('inventory'):
+                print("Sync Complete. No more pages.")
+                has_more_data = False
+                break
+
+            inventory_list = data['data']['inventory']
+            print(f" -> Processing {len(inventory_list)} items...")
+
+            # 2. Loop through items and send to Oracle
+            for item in inventory_list:
+                
+                # --- LOGIC: If SKU is missing, use ASIN ---
+                sku_val = item.get('SKU')
+                asin_val = item.get('ASIN')
+
+                if not sku_val or sku_val == "":
+                    sku_val = asin_val
+
+                # Prepare the Payload for Oracle
+                # Note: Oracle REST APIs expect column names in JSON (Case sensitive depending on setup)
+                oracle_payload = {
+                    "sku": sku_val,
+                    "asin": asin_val,
+                    "product_name": item.get('product_name'),
+                    "image_url": item.get('product_image_url'),
+                    "product_condition": item.get('product_condition'),
+                    "dimensions": item.get('product_dimension'),
+                    "dimension_unit": item.get('product_dimension_unit'),
+                    "packing_type": item.get('product_packing_type'),
+                    "total_available_qty": item.get('available', 0)
+                }
+
+                # 3. Send to Oracle APEX (Upsert logic handled by APEX if configured, otherwise simple Insert)
+                # 3. Send to Oracle APEX (Now using the Merge Handler)
+                try:
+                    ords_response = requests.post(DESTINATION_API_URL, json=oracle_payload, headers=oracle_headers)
+                    
+                    if ords_response.status_code == 200:
+                        print(f"   ✅ Synced: {sku_val}")
+                    else:
+                        print(f"   ⚠️ Error syncing {sku_val}: {ords_response.text}")
+                        
+                except Exception as api_err:
+                    print(f"   ❌ Connection Error: {api_err}")
+
+            page += 1
+            time.sleep(0.5) # Slight delay to be polite
+
+        except Exception as e:
+            print(f"Script Error: {e}")
+            has_more_data = False
+
+if __name__ == "__main__":
+    sync_master_products()
